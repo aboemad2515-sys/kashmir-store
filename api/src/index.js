@@ -1,66 +1,159 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { parse } = require('csv-parse');
+const prisma = require('./prisma');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let sampleProducts = [
-  { id: 1, title: 'شال كشمير فاخر', price: 250, currency: 'SAR', category: 'شالات', description: 'شال كشمير ناعم وفاخر، مصنوع من أجود الخامات.', images: ['/logo.svg'], stock: 10 },
-  { id: 2, title: 'ساعه رجالية أنيقة', price: 450, currency: 'SAR', category: 'ساعات', description: 'ساعة أنيقة بمينا كلاسيكي.', images: ['/logo.svg'], stock: 5 },
-  { id: 3, title: 'جاكيت صوف', price: 350, currency: 'SAR', category: 'ملابس', description: 'جاكيت صوف دافئ ومريح.', images: ['/logo.svg'], stock: 8 }
-];
-
-// Admin credentials (change in production / store securely)
-const ADMIN_USER = 'kashmir@kashmir-store.com';
-const ADMIN_PASS = '775059592';
-const ADMIN_TOKEN = 'admin-token-123';
+const upload = multer({ storage: multer.memoryStorage() });
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
-app.get('/api/products', (req, res) => res.json(sampleProducts));
-app.get('/api/products/:id', (req, res) => {
+
+// Public product endpoints
+app.get('/api/products', async (req, res) => {
+  const products = await prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
+  res.json(products);
+});
+
+app.get('/api/products/:id', async (req, res) => {
   const id = Number(req.params.id);
-  const p = sampleProducts.find(x => x.id === id);
+  const p = await prisma.product.findUnique({ where: { id } });
   if (!p) return res.status(404).json({ error: 'Not found' });
   res.json(p);
 });
 
-// Admin login
-app.post('/api/admin/login', (req, res) => {
+// Admin auth
+app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body;
-  if (email === ADMIN_USER && password === ADMIN_PASS) {
-    return res.json({ token: ADMIN_TOKEN });
-  }
-  res.status(401).json({ error: 'Invalid credentials' });
+  if (!email || !password) return res.status(400).json({ error: 'Missing credentials' });
+  const admin = await prisma.admin.findUnique({ where: { email } });
+  if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+  const match = await bcrypt.compare(password, admin.password);
+  if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+  const token = jwt.sign({ sub: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token });
 });
 
+// Middleware
 function checkAuth(req, res, next) {
   const auth = req.headers.authorization || '';
-  if (auth === `Bearer ${ADMIN_TOKEN}`) return next();
-  return res.status(401).json({ error: 'Unauthorized' });
+  if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+  const token = auth.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.admin = payload;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
 }
 
 // Admin product CRUD
-app.get('/api/admin/products', checkAuth, (req, res) => res.json(sampleProducts));
-app.post('/api/admin/products', checkAuth, (req, res) => {
+app.get('/api/admin/products', checkAuth, async (req, res) => {
+  const products = await prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
+  res.json(products);
+});
+
+app.post('/api/admin/products', checkAuth, async (req, res) => {
   const data = req.body;
-  const id = sampleProducts.length ? Math.max(...sampleProducts.map(p => p.id)) + 1 : 1;
-  const newP = { id, ...data };
-  sampleProducts.push(newP);
+  const newP = await prisma.product.create({ data: {
+    title: data.title || 'Untitled',
+    description: data.description || '',
+    price: Number(data.price) || 0,
+    currency: data.currency || 'SAR',
+    category: data.category || '',
+    images: data.images || [],
+    stock: Number(data.stock) || 0,
+    sku: data.sku || `SKU-${Date.now()}`
+  }});
   res.status(201).json(newP);
 });
-app.put('/api/admin/products/:id', checkAuth, (req, res) => {
+
+app.put('/api/admin/products/:id', checkAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const idx = sampleProducts.findIndex(p => p.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  sampleProducts[idx] = { ...sampleProducts[idx], ...req.body };
-  res.json(sampleProducts[idx]);
+  const data = req.body;
+  try {
+    const updated = await prisma.product.update({ where: { id }, data: {
+      title: data.title,
+      description: data.description,
+      price: data.price !== undefined ? Number(data.price) : undefined,
+      currency: data.currency,
+      category: data.category,
+      images: data.images,
+      stock: data.stock !== undefined ? Number(data.stock) : undefined,
+      sku: data.sku
+    }});
+    res.json(updated);
+  } catch (e) {
+    res.status(404).json({ error: 'Not found' });
+  }
 });
-app.delete('/api/admin/products/:id', checkAuth, (req, res) => {
+
+app.delete('/api/admin/products/:id', checkAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const idx = sampleProducts.findIndex(p => p.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  const removed = sampleProducts.splice(idx, 1);
-  res.json({ removed: removed[0] });
+  try {
+    const removed = await prisma.product.delete({ where: { id } });
+    res.json({ removed });
+  } catch (e) {
+    res.status(404).json({ error: 'Not found' });
+  }
+});
+
+// CSV import endpoint (multipart/form-data, field 'file')
+app.post('/api/admin/import-csv', checkAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const buffer = req.file.buffer;
+
+  parse(buffer, { columns: true, trim: true, skip_empty_lines: true }, async (err, records) => {
+    if (err) return res.status(400).json({ error: 'Invalid CSV' });
+    let imported = 0;
+    const errors = [];
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      try {
+        const title = r.title || r.name || `Product ${i+1}`;
+        const sku = r.sku && r.sku.length ? r.sku : `SKU-${Date.now()}-${i}`;
+        const images = r.images ? r.images.split('|').map(s => s.trim()).filter(Boolean) : [];
+        const price = r.price ? parseFloat(r.price) : 0;
+        const stock = r.stock ? parseInt(r.stock) : 0;
+
+        // upsert by sku (sku is unique)
+        await prisma.product.upsert({
+          where: { sku },
+          update: {
+            title,
+            description: r.description || '',
+            price,
+            currency: r.currency || 'SAR',
+            category: r.category || '',
+            images,
+            stock
+          },
+          create: {
+            title,
+            description: r.description || '',
+            price,
+            currency: r.currency || 'SAR',
+            category: r.category || '',
+            images,
+            stock,
+            sku
+          }
+        });
+        imported++;
+      } catch (e) {
+        errors.push({ row: i+1, error: e.message });
+      }
+    }
+    res.json({ imported, errors });
+  });
 });
 
 const PORT = process.env.PORT || 4000;
