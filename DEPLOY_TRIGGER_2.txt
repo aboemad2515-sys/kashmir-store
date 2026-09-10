@@ -1,0 +1,5 @@
+Triggering CI/CD after secrets were added
+
+This file was added to the repository to create a new commit and trigger the GitHub Actions workflow now that repository secrets (DATABASE_URL, RENDER_API_KEY, etc.) have been configured.
+
+Timestamp: 2026-09-10T00:00:00Z
